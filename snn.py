@@ -6,16 +6,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, Lambda, MaxPooling2D, Subtract
+from tensorflow.keras.layers import Input, Conv2D, Dense, Flatten, Lambda, MaxPooling2D, Subtract, BatchNormalization, Dropout
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import backend as K
+from tensorflow.keras.regularizers import l2
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, precision_score
+from sklearn.metrics import accuracy_score, precision_score, classification_report
 from scipy.spatial.distance import euclidean
+import warnings
+warnings.filterwarnings('ignore')
 
 # Path to your dataset
-DATASET_PATH = "C:/CODE/projects/snn_model/cry/"
+DATASET_PATH = "C:/Users/karti/Code/projects/infant-cry-classification/dataset/"
 
 # Categories (Ensure these match your actual folder names)
 CATEGORIES = ["belly_pain", "burping", "hungry", "discomfort", "tired"]
@@ -25,31 +28,45 @@ FIXED_DURATION = 7.0
 SAMPLE_RATE = 22050  # Standard sampling rate
 TIMESTEPS = 300  # Fixed MFCC time frames
 
-# Function to load, trim/pad, and extract MFCC features
+# Enhanced feature extraction with multiple audio features
 def extract_features(file_path):
-    y, sr = librosa.load(file_path, sr=SAMPLE_RATE)
+    try:
+        y, sr = librosa.load(file_path, sr=SAMPLE_RATE)
+        
+        # Adjust to exactly 7 seconds
+        target_length = int(FIXED_DURATION * SAMPLE_RATE)
+        if len(y) > target_length:
+            y = y[:target_length]  # Trim
+        elif len(y) < target_length:
+            y = np.pad(y, (0, target_length - len(y)))  # Pad with zeros
 
-    # Adjust to exactly 7 seconds
-    target_length = int(FIXED_DURATION * SAMPLE_RATE)
-    if len(y) > target_length:
-        y = y[:target_length]  # Trim
-    elif len(y) < target_length:
-        y = np.pad(y, (0, target_length - len(y)))  # Pad with zeros
+        # Extract multiple features
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40, n_fft=2048, hop_length=512)
+        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=40, n_fft=2048, hop_length=512)
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=2048, hop_length=512)
+        spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr, n_fft=2048, hop_length=512)
+        
+        # Convert mel spectrogram to log scale
+        log_mel = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        # Stack all features
+        features = np.vstack([mfcc, log_mel, chroma, spectral_contrast])
+        
+        # Normalize features
+        features = (features - np.mean(features)) / (np.std(features) + 1e-8)
 
-    # Extract MFCC
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+        # Resize to fixed shape
+        if features.shape[1] < TIMESTEPS:
+            features = np.pad(features, ((0, 0), (0, TIMESTEPS - features.shape[1])), mode='constant')
+        else:
+            features = features[:, :TIMESTEPS]
 
-    # Normalize MFCC values
-    mfcc = (mfcc - np.mean(mfcc)) / np.std(mfcc)
-
-    # Resize MFCC to a fixed shape
-    if mfcc.shape[1] < TIMESTEPS:
-        mfcc = np.pad(mfcc, ((0, 0), (0, TIMESTEPS - mfcc.shape[1])))
-    else:
-        mfcc = mfcc[:, :TIMESTEPS]
-
-    # Reshape to fit CNN (add channel dimension)
-    return np.expand_dims(mfcc, axis=-1)  # Shape: (40, TIMESTEPS, 1)
+        # Reshape to fit CNN (add channel dimension)
+        return np.expand_dims(features, axis=-1)  # Shape: (feature_dim, TIMESTEPS, 1)
+    
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return None
 
 # Function to visualize MFCC spectrogram
 def plot_mfcc(file_path):
@@ -62,7 +79,7 @@ def plot_mfcc(file_path):
     plt.title("MFCC Visualization")
     plt.show()
 
-# Load and preprocess dataset
+# Load and preprocess dataset with data validation
 def load_dataset():
     X, Y = [], []
     for category in CATEGORIES:
@@ -78,24 +95,49 @@ def load_dataset():
         for file in files:
             file_path = os.path.join(category_path, file)
             features = extract_features(file_path)
-            X.append(features)
-            Y.append(category)
+            if features is not None:
+                X.append(features)
+                Y.append(category)
 
     print(f"✅ Loaded {len(X)} samples from {len(CATEGORIES)} categories.")
+    
+    # Check class distribution
+    unique, counts = np.unique(Y, return_counts=True)
+    print("Class distribution:", dict(zip(unique, counts)))
+    
     return np.array(X), np.array(Y)
 
-# Define Siamese Network Model
+# Enhanced Siamese Network Model with better architecture
 def build_siamese_model(input_shape):
     input_layer = Input(shape=input_shape)
-    x = Conv2D(64, (3,3), activation='relu')(input_layer)
-    x = MaxPooling2D(pool_size=(2,2))(x)
-    x = Conv2D(128, (3,3), activation='relu')(x)
-    x = MaxPooling2D(pool_size=(2,2))(x)
+    
+    # First Conv Block
+    x = Conv2D(32, (3, 3), activation='relu', kernel_regularizer=l2(0.001))(input_layer)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.2)(x)
+    
+    # Second Conv Block
+    x = Conv2D(64, (3, 3), activation='relu', kernel_regularizer=l2(0.001))(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.2)(x)
+    
+    # Third Conv Block
+    x = Conv2D(128, (3, 3), activation='relu', kernel_regularizer=l2(0.001))(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.3)(x)
+    
     x = Flatten()(x)
-    x = Dense(128, activation='relu')(x)
+    x = Dense(256, activation='relu', kernel_regularizer=l2(0.001))(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    x = Dense(128, activation='relu', kernel_regularizer=l2(0.001))(x)
+    
     return Model(input_layer, x)
 
-# Build full Siamese network
+# Build full Siamese network with contrastive loss
 def build_siamese_network(input_shape):
     base_network = build_siamese_model(input_shape)
 
@@ -106,89 +148,181 @@ def build_siamese_network(input_shape):
     encoded_a = base_network(input_a)
     encoded_b = base_network(input_b)
 
-    # Compute absolute difference
-    diff = Subtract()([encoded_a, encoded_b])
-    output = Dense(1, activation='sigmoid')(diff)
+    # Compute L1 distance
+    l1_distance = Lambda(lambda tensors: K.abs(tensors[0] - tensors[1]))([encoded_a, encoded_b])
+    output = Dense(1, activation='sigmoid')(l1_distance)
 
     return Model(inputs=[input_a, input_b], outputs=output)
 
-# Generate pairs for contrastive learning
+# Improved pair generation with balanced sampling
 def create_pairs(X, Y):
     pairs, labels = [], []
     class_indices = {label: np.where(Y == label)[0] for label in np.unique(Y)}
-
+    
+    # Ensure balanced pairs
+    min_samples = min(len(indices) for indices in class_indices.values())
+    
     for idx in range(len(X)):
         current_class = Y[idx]
-        pos_idx = random.choice(class_indices[current_class])
-        neg_class = random.choice([c for c in np.unique(Y) if c != current_class])
-        neg_idx = random.choice(class_indices[neg_class])
-
+        
+        # Positive pair
+        pos_indices = class_indices[current_class]
+        pos_idx = random.choice(pos_indices)
         pairs.append([X[idx], X[pos_idx]])
         labels.append(1)  # Similar
-
+        
+        # Negative pair - choose from different class
+        neg_classes = [c for c in np.unique(Y) if c != current_class]
+        neg_class = random.choice(neg_classes)
+        neg_idx = random.choice(class_indices[neg_class])
         pairs.append([X[idx], X[neg_idx]])
         labels.append(0)  # Dissimilar
 
     return np.array(pairs), np.array(labels)
 
+# Contrastive loss function for better similarity learning
+def contrastive_loss(y_true, y_pred, margin=1.0):
+    square_pred = K.square(y_pred)
+    margin_square = K.square(K.maximum(margin - y_pred, 0))
+    return K.mean(y_true * square_pred + (1 - y_true) * margin_square)
+
 # Load and process dataset
+print("Loading dataset...")
 X, Y = load_dataset()
 
 # Ensure dataset is loaded
 if len(X) == 0:
     print("❌ No data loaded! Check dataset path and files.")
-else:
-    # Encode labels as numerical values
-    encoder = LabelEncoder()
-    Y_numeric = encoder.fit_transform(Y)
+    exit()
 
-    # Split dataset into train and test
-    X_train, X_test, Y_train, Y_test = train_test_split(X, Y_numeric, test_size=0.2, random_state=42)
+# Encode labels as numerical values
+encoder = LabelEncoder()
+Y_numeric = encoder.fit_transform(Y)
 
-    # Generate pairs for training and testing
-    train_pairs, train_labels = create_pairs(X_train, Y_train)
-    test_pairs, test_labels = create_pairs(X_test, Y_test)
+# Split dataset into train and test with stratification
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y_numeric, test_size=0.2, random_state=42, stratify=Y_numeric
+)
 
-    # Build SNN model
-    input_shape = (40, TIMESTEPS, 1)  # Shape of MFCC features
-    siamese_model = build_siamese_network(input_shape)
+print(f"Training samples: {len(X_train)}")
+print(f"Testing samples: {len(X_test)}")
 
-    # Compile model
-    siamese_model.compile(optimizer=Adam(0.001), loss="binary_crossentropy", metrics=["accuracy"])
+# Generate pairs for training and testing
+print("Generating training pairs...")
+train_pairs, train_labels = create_pairs(X_train, Y_train)
+print("Generating testing pairs...")
+test_pairs, test_labels = create_pairs(X_test, Y_test)
 
-    # Train model
-    siamese_model.fit([train_pairs[:, 0], train_pairs[:, 1]], train_labels, batch_size=16, epochs=20)
+print(f"Training pairs: {len(train_pairs)}")
+print(f"Testing pairs: {len(test_pairs)}")
 
-    # Evaluate model
-    y_pred = siamese_model.predict([test_pairs[:, 0], test_pairs[:, 1]])
-    y_pred = np.round(y_pred)  # Convert probabilities to binary labels
+# Build SNN model - Update input shape based on new feature dimension
+# With stacked features: MFCC(40) + Mel(40) + Chroma(12) + Spectral Contrast(7) = 99 features
+input_shape = (99, TIMESTEPS, 1)  # Updated shape for stacked features
+siamese_model = build_siamese_network(input_shape)
 
-    accuracy = accuracy_score(test_labels, y_pred)
-    precision = precision_score(test_labels, y_pred)
+# Compile model with lower learning rate
+siamese_model.compile(
+    optimizer=Adam(learning_rate=0.0001), 
+    loss="binary_crossentropy", 
+    metrics=["accuracy"]
+)
 
-    print(f"✅ Model Accuracy: {accuracy:.4f}")
-    print(f"✅ Model Precision: {precision:.4f}")
+# Add callbacks for better training
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
 
-    # Test with a new audio file
-    test_file = "C:/CODE/projects/snn_model/test.wav"
+callbacks = [
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-7),
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+]
+
+# Train model with validation split
+print("Starting training...")
+history = siamese_model.fit(
+    [train_pairs[:, 0], train_pairs[:, 1]], 
+    train_labels, 
+    batch_size=32,
+    epochs=50,
+    validation_split=0.2,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# Evaluate model
+print("Evaluating model...")
+y_pred_prob = siamese_model.predict([test_pairs[:, 0], test_pairs[:, 1]])
+y_pred = np.round(y_pred_prob)  # Convert probabilities to binary labels
+
+accuracy = accuracy_score(test_labels, y_pred)
+precision = precision_score(test_labels, y_pred)
+
+print(f"✅ Model Accuracy: {accuracy:.4f}")
+print(f"✅ Model Precision: {precision:.4f}")
+
+# Enhanced prediction function using the trained Siamese network
+def predict_category(siamese_model, test_feature, X_train, Y_train, encoder, num_matches=5):
+    """Predict category using similarity scores from Siamese network"""
+    similarities = []
+    
+    for train_feature, train_label in zip(X_train, Y_train):
+        # Create pair and get similarity score
+        pair = np.array([[test_feature, train_feature]])
+        similarity_score = siamese_model.predict([pair[:, 0], pair[:, 1]], verbose=0)[0][0]
+        similarities.append((similarity_score, train_label))
+    
+    # Sort by similarity score (highest first)
+    similarities.sort(key=lambda x: x[0], reverse=True)
+    
+    # Get top matches
+    top_matches = similarities[:num_matches]
+    
+    # Count votes from top matches
+    vote_count = {}
+    for score, label in top_matches:
+        vote_count[label] = vote_count.get(label, 0) + 1
+    
+    # Get predicted label with most votes
+    predicted_label = max(vote_count, key=vote_count.get)
+    
+    return predicted_label, top_matches
+
+# Test with a new audio file
+test_file = "C:/Users/karti/Code/projects/infant-cry-classification/test.wav"
+if os.path.exists(test_file):
     test_feature = extract_features(test_file)
+    
+    if test_feature is not None:
+        # Use the enhanced prediction function
+        predicted_label, top_matches = predict_category(siamese_model, test_feature, X_train, Y_train, encoder)
+        
+        print(f"Predicted Category: {encoder.inverse_transform([predicted_label])[0]}")
+        print("Top 5 matches:")
+        for i, (score, label) in enumerate(top_matches, 1):
+            print(f"  {i}. {encoder.inverse_transform([label])[0]} (similarity: {score:.4f})")
+        
+        # Visualize MFCC of test file
+        plot_mfcc(test_file)
+    else:
+        print("❌ Failed to extract features from test file")
+else:
+    print(f"❌ Test file not found: {test_file}")
 
-    # Find the closest match from reference data
-    reference_data = {label: [] for label in np.unique(Y_train)}
-    for label, feature in zip(Y_train, X_train):
-        reference_data[label].append(feature)
+# Plot training history
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
 
-    min_distance = float("inf")
-    predicted_label = None
-
-    for ref_label, ref_features_list in reference_data.items():
-        for ref_features in ref_features_list:
-            distance = euclidean(test_feature.flatten(), ref_features.flatten())
-            if distance < min_distance:
-                min_distance = distance
-                predicted_label = ref_label
-
-    print(f"Predicted Category: {encoder.inverse_transform([predicted_label])[0]}")
-
-    # Visualize MFCC of test file
-    plot_mfcc(test_file)
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.tight_layout()
+plt.show()
